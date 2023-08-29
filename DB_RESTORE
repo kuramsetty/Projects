@@ -1,0 +1,36 @@
+import boto3
+import time
+
+def lambda_handler(event, context):
+    rds_client = boto3.client('rds', region_name='us-east-1')
+   
+    # Restore DB cluster from snapshot
+    restore_cluster_response = rds_client.restore_db_cluster_from_snapshot(
+        DBClusterIdentifier=event['DBCluster'],
+        SnapshotIdentifier=event['Snapshot'],
+        Engine='aurora-postgresql',
+        DBSubnetGroupName='imr-vpc-dev',
+        VpcSecurityGroupIds=['sg-08ee0ce538384ce46']
+    )
+    time.sleep(500)
+    # Get the newly created DB cluster's endpoint
+    cluster_endpoint = restore_cluster_response['DBCluster']['Endpoint']
+   
+   
+   
+    # Create DB instance within the newly created DB cluster
+    create_instance_response = rds_client.create_db_instance(
+        DBInstanceIdentifier=event['DBInstance'],
+        DBInstanceClass='db.r6g.2xlarge',
+        Engine='aurora-postgresql',
+        DBClusterIdentifier=event['DBCluster'],
+        PubliclyAccessible=True
+    )
+   
+    time.sleep(300)
+   
+    return {
+        'message': 'DB cluster and instance creation initiated successfully',
+        'cluster_endpoint': cluster_endpoint,
+        'instance_id': create_instance_response['DBInstance']['DBInstanceIdentifier']
+    }
