@@ -1,0 +1,32 @@
+import boto3
+import time
+
+def lambda_handler(event, context):
+    rds_client = boto3.client('rds', region_name='us-east-1')
+   
+    # Delete DB instance
+    try:
+        rds_client.delete_db_instance(
+            DBInstanceIdentifier=event['DBInstance'],
+            SkipFinalSnapshot=True
+        )
+        print("DB instance deletion initiated")
+    except Exception as e:
+        print(f"Error deleting DB instance: {e}")
+       
+    time.sleep(600)    
+   
+    # Delete DB cluster
+    try:
+        rds_client.delete_db_cluster(
+            DBClusterIdentifier=event['DBCluster'],
+            SkipFinalSnapshot=True
+        )
+        print("DB cluster deletion initiated")
+    except Exception as e:
+        print(f"Error deleting DB cluster: {e}")
+   
+    return {
+        'message': 'DB instance and cluster deletion initiated'
+    }
+
