@@ -1,0 +1,21 @@
+import boto3
+
+def lambda_handler(event, context):
+    rds_client = boto3.client('rds', region_name='us-east-1')
+   
+
+   
+    # Create a DB cluster snapshot
+    try:
+        response = rds_client.create_db_cluster_snapshot(
+            DBClusterIdentifier=event['DBCluster'],
+            DBClusterSnapshotIdentifier=event['Snapshot']
+        )
+        print(f"DB cluster snapshot created: {response['DBClusterSnapshot']['DBClusterSnapshotIdentifier']}")
+    except Exception as e:
+        print(f"Error creating DB cluster snapshot: {e}")
+
+    return {
+        'message': 'DB cluster snapshot creation initiated'
+    }
+
