@@ -1,0 +1,273 @@
+import argparse
+import re
+from time import sleep
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+import json
+import requests
+import boto3
+from botocore.exceptions import ClientError
+import urllib.parse  
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+from pyspark.sql.types import *
+import time
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import *
+import sys
+from datetime import datetime
+import concurrent.futures
+date_str = (datetime.now() + timedelta(days=0)).strftime("%Y-%m-%d")
+
+
+spark = SparkSession.builder.appName('json-payload').getOrCreate()
+
+spark = SparkSession.builder.getOrCreate()
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+glue_context = GlueContext(SparkSession.builder.getOrCreate())
+args = getResolvedOptions(sys.argv, ["job_name", "ingestion_type", "ENV"])
+ingestion_type = args["ingestion_type"]
+env = args["ENV"]
+job = Job(glue_context)
+job.init(args["job_name"], args)
+
+last_24_hours = (datetime.utcnow() - timedelta(days=120)).isoformat() + "Z"
+
+print(ingestion_type)
+
+
+
+# Initialize the DynamoDB resource
+dynamodb = boto3.resource("dynamodb")
+
+# Reference the table
+table = dynamodb.Table("data_lake_delta")
+
+
+# Used for DynamoDB table updates
+now = datetime.utcnow()
+timestamp = now.isoformat().split(".")[0]
+
+
+last = table.get_item(Key={"job_name": args.get('job_name')}).get("Item", None)
+
+if last:
+    last_import = last.get("last_import", None)
+    last_full_import = last.get("last_full_import", None)
+else:
+    last_import = timestamp
+    last_full_import = timestamp
+
+print(f"Last import: {last_import}, last full import: {last_full_import}.")
+records_received = 0
+
+
+
+def get_secret():
+    """Method to fetch secret creds."""
+    secret_name = "cdp_cloud"
+    region_name = "eu-central-1"
+
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        print(f"Error fetching secret: {e}")
+        raise e
+
+    # Decrypts secret if it's a string
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)
+
+# Fetch credentials from AWS Secrets Manager
+secret_data = get_secret()
+client_id = secret_data['client_id']
+client_secret = secret_data['client_secret']
+
+def get_access_token():
+	data = {
+    "grant_type": "client_credentials",
+    "client_id": client_id,
+    "client_secret": client_secret,
+	}
+	url = "https://oauth2.us1.gigya.com/oauth2/token"
+
+	# Send the POST request to the token URL
+	response = requests.post(url, data=data)
+	if response.status_code == 200:
+		token = response.json().get("access_token")
+		print(f"Access Token: {token}")
+		return token
+	else:
+		print(f"Error {response.status_code}: {response.text}")
+		exit()
+
+
+
+def fetch_data_with_cursor(access_token, api_url, cursor_id=None):
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    whole_data = []
+
+    while True:  # Instead of recursion, use a loop
+        params = {}
+        if cursor_id:
+            params['CursorId'] = cursor_id
+
+        time.sleep(0.2)  # Avoid hitting API rate limits
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            profile = data.get('profiles', [])
+            next_cursor_id = data.get('nextCursorId')
+            page_count = data.get('count', 0)
+
+            if profile:
+                whole_data.extend(profile)
+
+            if not next_cursor_id or page_count == 0:  # Exit condition
+                print("No more data to fetch.")
+                break
+            else:
+                print(f"Fetching next page with cursor_id: {next_cursor_id}")
+                cursor_id = next_cursor_id  # Move to the next page
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            token = get_access_token()  # Refresh token and retry
+            headers['Authorization'] = f'Bearer {token}'
+
+    return whole_data
+
+
+if ingestion_type == "FULL":
+    query = f"SELECT * FROM profile"
+    write_mode = "overwrite"
+else:
+	query = f"SELECT * FROM profile WHERE updated > '{last_import}'"
+	write_mode = "append"
+
+print("query", query)
+# Encode the query properly for a URL
+encoded_query = urllib.parse.quote(query)
+
+
+cur_url_con = f"https://cdp.eu5.gigya.com/api/businessunits/4_cFrm6IsvdLW1rG95tVZ2qA/views/HFmKUL1GfodqAHEeCXTiCA/customers?query={encoded_query}&openCursor=true"
+
+
+cur_url_uni = f"https://cdp.eu5.gigya.com/api/businessunits/4_cFrm6IsvdLW1rG95tVZ2qA/views/HA2hHyAekHYNDQZ0xc0DWQ/customers?query={encoded_query}&openCursor=true"
+
+
+
+
+def fetch_parallel(api_url):
+    token_local = get_access_token()  # Each task gets its own token
+    return fetch_data_with_cursor(token_local, api_url, cursor_id=None)
+
+try:
+    # Run both API calls concurrently using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_con = executor.submit(fetch_parallel, cur_url_con)
+        future_uni = executor.submit(fetch_parallel, cur_url_uni)
+        
+        data_con = future_con.result()
+        data_uni = future_uni.result()
+    
+    print("Fetched", len(data_con), "records from con endpoint")
+    print("Fetched", len(data_uni), "records from uni endpoint")
+    
+    
+    
+    # Columns to convert from string to timestamp
+    columns_to_convert = ["created", "updated", "birthDate", "firstSeen", "lastSeen","updatedTimestamp"]
+    
+    if data_con != []:
+        json_data = json.dumps(data_con)
+        s3 = boto3.client('s3')
+        try:
+            bucket_name = f"cap-{env}-data-lake"
+            s3_key = f"cdp-cloud/raw/profiles/con_profile/{date_str}.json"
+            response = s3.put_object(
+                Bucket=bucket_name, Key=s3_key, Body=json_data)
+            # Check response status
+            if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                print(f"Successfully uploaded {s3_key} to {bucket_name}")
+            else:
+                print(f"Failed to upload {s3_key}. Response: {response}")
+        except Exception as e:
+            print(f"Error uploading to S3: {str(e)}")
+    
+        raw_s3_path = f"s3://cap-{env}-data-lake/cdp-cloud/raw/profiles/con_profile/{date_str}.json"
+        df_profile_transformed = spark.read.json(raw_s3_path)
+                
+        df_profile_transformed = df_profile_transformed.select('*', 'attributes.*').drop('attributes').dropDuplicates()
+        
+        df_profile_transformed = df_profile_transformed.withColumn("updatedTimestamp", date_format(from_unixtime(col("updatedTimestamp") / 1000), "yyyy-MM-dd'T'HH:mm:ss.SSSSSSS")) 
+        
+        for col_name in set(columns_to_convert).intersection(df_profile_transformed.columns):
+                df_profile_transformed = df_profile_transformed.withColumn(
+                    col_name, col(col_name).cast("timestamp"))
+
+        df_profile_transformed.repartition(5).write.mode(write_mode).parquet(
+            f"s3://cap-{env}-data-lake/cdp-cloud/transformed/profiles/con_profile/{date_str}")
+    
+    
+    if data_uni != []:
+        json_data = json.dumps(data_uni)
+        s3 = boto3.client('s3')
+        try:
+            bucket_name = f"cap-{env}-data-lake"
+            s3_key = f"cdp-cloud/raw/profiles/uni_profile/{date_str}.json"
+            response = s3.put_object(
+                Bucket=bucket_name, Key=s3_key, Body=json_data)
+            # Check response status
+            if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                print(f"Successfully uploaded {s3_key} to {bucket_name}")
+            else:
+                print(f"Failed to upload {s3_key}. Response: {response}")
+        except Exception as e:
+            print(f"Error uploading to S3: {str(e)}")
+    
+        raw_s3_path = f"s3://cap-{env}-data-lake/cdp-cloud/raw/profiles/uni_profile/{date_str}.json"
+        df_profile_transformed_uni = spark.read.json(raw_s3_path)
+    
+        df_profile_transformed_uni = df_profile_transformed_uni.select('*', 'attributes.*').drop('attributes').dropDuplicates()
+        
+        df_profile_transformed_uni = df_profile_transformed_uni.withColumn("updatedTimestamp", date_format(from_unixtime(col("updatedTimestamp") / 1000), "yyyy-MM-dd'T'HH:mm:ss.SSSSSSS"))
+        
+        for col_name in set(columns_to_convert).intersection(df_profile_transformed_uni.columns):
+                df_profile_transformed_uni = df_profile_transformed_uni.withColumn(
+                    col_name,  col(col_name).cast("timestamp"))
+            
+        df_profile_transformed_uni.repartition(5).write.mode(write_mode).parquet(
+            f"s3://cap-{env}-data-lake/cdp-cloud/transformed/profiles/uni_profile/")
+    	
+    
+    
+    table.put_item(
+        Item={
+            "last_import": timestamp,
+            "last_full_import": last_full_import,
+            "job_name": args.get('job_name'),
+            "records_received": records_received,
+        }
+    )	
+
+except Exception as err:
+    traceback.print_exc()
+    print(err)
+    raise Exception(
+        "Error encountered while executing the SQL. Check the error stack in Output logs")
+        
+job.commit()
