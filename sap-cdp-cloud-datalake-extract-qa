@@ -1,0 +1,338 @@
+import argparse
+import re
+from time import sleep
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+import json
+import requests
+import boto3
+from botocore.exceptions import ClientError
+import urllib.parse  
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+from pyspark.sql.types import *
+import time
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import *
+import sys
+from datetime import datetime
+import concurrent.futures
+import concurrent.futures
+import time
+import requests
+from pyspark.context import SparkContext
+from awsglue.utils import getResolvedOptions
+date_str = (datetime.now() + timedelta(days=0)).strftime("%Y-%m-%d")
+
+spark = SparkSession.builder.getOrCreate()
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+glue_context = GlueContext(SparkSession.builder.getOrCreate())
+args = getResolvedOptions(sys.argv, ["job_name", "ingestion_type", "ENV"])
+ingestion_type = args["ingestion_type"]
+env = args["ENV"]
+job = Job(glue_context)
+job.init(args["job_name"], args)
+
+print(ingestion_type)
+
+# Initialize the DynamoDB resource
+dynamodb = boto3.resource("dynamodb")
+
+# Reference the table
+table = dynamodb.Table("data_lake_delta")
+
+# Used for DynamoDB table updates
+now = datetime.utcnow()
+timestamp = now.isoformat().split(".")[0]
+
+last = table.get_item(Key={"job_name": args["job_name"]}).get("Item", None)
+
+if last:
+    last_import = last.get("last_import", None)
+    last_full_import = last.get("last_full_import", None)
+else:
+    last_import = timestamp
+    last_full_import = timestamp
+
+print(f"Last import: {last_import}, last full import: {last_full_import}.")
+records_received = 0
+
+def get_secret():
+    """Method to fetch secret creds."""
+    secret_name = "cdp_cloud"
+    region_name = "eu-central-1"
+
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        print(f"Error fetching secret: {e}")
+        raise e
+
+    # Decrypts secret if it's a string
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)
+
+# Fetch credentials from AWS Secrets Manager
+secret_data = get_secret()
+client_id = secret_data['client_id']
+client_secret = secret_data['client_secret']
+
+def get_access_token():
+	data = {
+    "grant_type": "client_credentials",
+    "client_id": client_id,
+    "client_secret": client_secret,
+	}
+	url = "https://oauth2.us1.gigya.com/oauth2/token"
+
+	# Send the POST request to the token URL
+	response = requests.post(url, data=data)
+	if response.status_code == 200:
+		token = response.json().get("access_token")
+		#print(f"Access Token: {token}")
+		return token
+	else:
+		print(f"Error {response.status_code}: {response.text}")
+		exit()
+
+def fetch_data_with_cursor(access_token, api_url, cursor_id=None):
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    activity_data = []
+
+    while True:  # Instead of recursion, use a loop
+        #print(api_url)
+        params = {}
+        if cursor_id:
+            params['CursorId'] = cursor_id
+
+        time.sleep(0.2)  # Avoid hitting API rate limits
+        response = requests.get(api_url, headers=headers, params=params)
+        # print(response)
+        # print(response.status_code)
+        if response.status_code == 200:
+            data = response.json()
+            activities = data.get('activities', [])
+            next_cursor_id = data.get('nextCursorId')
+            page_count = data.get('count', 0)
+
+            if activities:
+                activity_data.extend(activities)
+
+            if not next_cursor_id or page_count == 0:  # Exit condition
+                print("No more data to fetch.")
+                break
+            else:
+                #print(f"Fetching next page with cursor_id: {next_cursor_id}")
+                cursor_id = next_cursor_id  # Move to the next page
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            token = get_access_token()  # Refresh token and retry
+            headers['Authorization'] = f'Bearer {token}'
+
+    return activity_data
+
+def api_call_worker(token, ids, activity_type, query):
+    """Worker function for parallel execution"""
+    api_url = f"https://cdp.eu5.gigya.com/api/businessunits/4_cFrm6IsvdLW1rG95tVZ2qA/views/HA2hHyAekHYNDQZ0xc0DWQ/customers/{ids}/activities?query={query}&openCursor=true"
+    token = get_access_token()
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    cursor_id = None
+    final_data = []
+    not_found_ids = []
+
+    while True:
+        params = {}
+        if cursor_id:
+            params['CursorId'] = cursor_id
+
+        time.sleep(1)  # Avoid hitting API rate limits
+        #print(api_url)
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            next_cursor_id = data.get('nextCursorId')
+            page_count = data.get('count', 0)
+
+            if "activities" in data and data["activities"]:
+                for record in data["activities"]:
+                    record["cdp_id"] = ids
+                    final_data.append(record)
+
+            if not next_cursor_id or page_count == 0:  
+                break
+            else:
+                cursor_id = next_cursor_id  
+        
+        elif response.status_code == 401 or response.status_code == 403:  # Unauthorized / Permission Denied
+            print(f"Token expired or permission issue. Refreshing token... (Error: {response.status_code})")
+            print(cursor_id)
+            token = get_access_token()  # Refresh token
+            headers['Authorization'] = f'Bearer {token}'
+            
+            #**RETRY the same request after getting a new token**
+            break  
+
+        elif response.status_code == 404:
+            print(f"ID {ids} not found.")
+            #not_found_ids.append(ids)
+            break
+
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            break  # Stop execution if unexpected errors occur
+
+    return final_data, not_found_ids
+    
+def api_call_parallel(token, cdpids, activity_type, query, max_workers=10):
+    """Parallel execution using ThreadPoolExecutor"""
+    final_data = []
+    not_found_ids = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_id = {executor.submit(api_call_worker, token, ids, activity_type, query): ids for ids in cdpids}
+
+        for future in concurrent.futures.as_completed(future_to_id):
+            try:
+                data, not_found = future.result()
+                final_data.extend(data)
+                # not_found_ids.extend(not_found)
+                # print("Not found ids",not_found_ids)
+            except Exception as e:
+                print(f"Error processing {future_to_id[future]}: {e}")
+
+    return final_data
+    
+try:
+    activities_list = [
+        'activity_webinar_event', 'activity_email_campaign', 'activity_lead',
+        'activity_form_submission', 'activity_interesting_moment',
+        'activity_external_upload', 'activity_opportunity',
+        'activity_tradefair_event','activity_webbehavior'
+    ]
+
+    #activities_list = ['activity_webbehavior']
+    for activity_type in activities_list:
+        print(f"Fetching data for: {activity_type}")
+        if ingestion_type == "FULL":
+            query = f"select * from {activity_type}"
+            write_mode = "overwrite"
+        else:
+            query = f"select * from {activity_type} WHERE updated >= '{last_import}'"
+            write_mode = "append"
+
+        token = get_access_token()
+
+        if activity_type == "activity_webbehavior":
+            df_con = glue_context.create_dynamic_frame.from_catalog(
+                "sap-cdp-cloud", "con_profile").toDF()
+            if ingestion_type != "FULL":
+                df_con = df_con.filter(col("updated") > last_import)    
+            df_con = df_con.withColumn("primaryCdpId", split(
+                col("primaryCdpId"), ":")[1]).dropDuplicates(["primaryCdpId"])
+
+            df_uni = glue_context.create_dynamic_frame.from_catalog(
+                "sap-cdp-cloud", "uni_profile").toDF()
+            if ingestion_type != "FULL":
+                df_uni = df_uni.filter(col("updated") > last_import)
+            df_uni = df_uni.withColumn("primaryCdpId", split(
+                col("primaryCdpId"), ":")[1]).dropDuplicates(["primaryCdpId"])
+
+            print("count df_con", df_con.count())
+            print("count df_uni", df_uni.count())
+
+            customer_ids = [row["primaryCdpId"]
+                            for row in df_con.collect()] + [row["primaryCdpId"] for row in df_uni.collect()]
+
+            print("len customer_ids", len(customer_ids))
+            activity_data = api_call_parallel(
+                token, customer_ids, activity_type, query, max_workers=10)
+
+        else:
+            api_url = f"https://cdp.eu5.gigya.com/api/businessunits/4_cFrm6IsvdLW1rG95tVZ2qA/views/HA2hHyAekHYNDQZ0xc0DWQ/activities?query={query}&openCursor=true"
+            activity_data = fetch_data_with_cursor(
+                token, api_url, cursor_id=None)
+
+        if activity_data != []:
+            json_data = json.dumps(activity_data)
+            s3 = boto3.client('s3')
+            try:
+                bucket_name = f"cap-{env}-data-lake"
+                s3_key = f"cdp-cloud/raw/activities/{activity_type}/{date_str}.json"
+                response = s3.put_object(
+                    Bucket=bucket_name, Key=s3_key, Body=json_data)
+                # Check response status
+                if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    print(f"Successfully uploaded {s3_key} to {bucket_name}")
+                else:
+                    print(f"Failed to upload {s3_key}. Response: {response}")
+            except Exception as e:
+                print(f"Error uploading to S3: {str(e)}")
+
+            raw_s3_path = f"s3://cap-{env}-data-lake/cdp-cloud/raw/activities/{activity_type}/{date_str}.json"
+            activity_df = spark.read.json(raw_s3_path)
+            activity_df = activity_df.select(
+                "*", "attributes.*").drop("attributes")
+            # Debugging: Print schema and sample records
+            print("activity_df", activity_df.printSchema())
+            columns_to_convert = [
+                "created", "updated", "cov_email_act_date", "cov_email_sent_on",
+                "cov_submission_date", "cov_moment_datetime", "cov_created_at",
+                "cov_end_date", "cov_start_date", "cov_updated_at", "cov_opp_close_date",
+                "cov_opp_last_act_dt", "cov_opp_start_date", "cov_tradefair_date",
+                "cov_web_act_date", "cov_first_join", "cov_last_leave", "cov_web_activity_dt",
+                "birthDate", "firstSeen", "lastSeen"
+            ]
+            # Convert only if the column exists in DataFrame
+            for col_name in set(columns_to_convert).intersection(activity_df.columns):
+                activity_df = activity_df.withColumn(
+                    col_name, to_timestamp(col(col_name)))
+
+            # Define S3 path dynamically
+            s3_path = f"s3://cap-{env}-data-lake/cdp-cloud/transformed/activities/{activity_type}/"
+            print(f"Writing to {s3_path}")
+
+            # Write to S3
+            try:
+                activity_df.repartition(5).write.mode(
+                    write_mode).parquet(s3_path)
+            except Exception as e:
+                print(f"Error writing {activity_type} to S3: {str(e)}")
+
+            del activity_df
+        else:
+            print("empty activity_data")
+
+    table.put_item(
+        Item={
+            "last_import": timestamp,
+            "last_full_import": last_full_import,
+            "job_name": args.get('job_name'),
+            "records_received": records_received,
+        }
+    )
+
+except Exception as err:
+    traceback.print_exc()
+    print(err)
+    raise Exception(
+        "Error encountered while executing the SQL. Check the error stack in Output logs")
+
+job.commit()
