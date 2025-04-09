@@ -1,0 +1,107 @@
+import sys
+import traceback
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col
+from awsglue.context import GlueContext
+from awsglue.job import Job
+import boto3
+import json
+import requests
+
+
+# Initialize Glue and Spark Context
+glueContext = GlueContext(SparkContext.getOrCreate())
+spark = glueContext.spark_session
+args = getResolvedOptions(sys.argv, ["JOB_NAME","filename","destination"])
+missingfilename = args["filename"]
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+# Destination Path
+destination = args["destination"]
+
+# Get credentials from AWS Secrets Manager
+secret = json.loads(
+    boto3.client("secretsmanager").get_secret_value(SecretId="sap-c4c-odata")["SecretString"]
+)
+auth = (secret["username"], secret["password"])
+
+# Utility function to read data
+def read_data_function(database, table_name):
+    return glueContext.create_dynamic_frame.from_catalog(database=database, table_name=table_name).toDF()
+
+# Read base data and filter it
+org_df = read_data_function("sap_c4c", "changedocumentcollection").select("objectuuid", "id").dropDuplicates()
+
+# Read UUIDs from the S3 file
+data_df = spark.read.text(f"s3://tempbucketcdc/{missingfilename}").withColumnRenamed("value", "objectuuid")
+filtered_df = data_df.filter("objectuuid IS NOT NULL")
+uuids_list = [row["objectuuid"] for row in filtered_df.select("objectuuid").distinct().collect()]
+
+# Function to process each UUID in parallel
+def process_uuid(uuid):
+    try:
+        url_base = (
+            f"https://my343420.crm.ondemand.com/sap/c4c/odata/v1/changedoclist/ChangeDocumentCollection"
+            f"?$filter=BusinessObject eq 'Opportunity' and ObjectUUID eq '{uuid}'&$format=json"
+        )
+        headers = {"Accept-Language": "en", "Accept": "application/json"}
+        
+        skip_result = 0
+        top_result = 1000
+        final_data = []
+
+        while True:
+            url = f"{url_base}&$skip={skip_result}&$top={top_result}"
+            try:
+                result = requests.get(url, auth=auth, headers=headers)
+                result.raise_for_status()
+                res = result.json()
+                response = res.get("d", {}).get("results", [])
+
+                if not response:
+                    break
+
+                final_data.extend(response)
+                skip_result += top_result
+            except requests.RequestException as e:
+                print(f"API request failed for UUID {uuid}. Error: {str(e)}")
+                break
+
+        if not final_data:
+            return []
+        
+        return final_data
+    except Exception as e:
+        print(f"Unexpected error for UUID {uuid}: {e}")
+        return []
+
+# Parallelize UUID processing
+sc = spark.sparkContext
+uuid_rdd = sc.parallelize(uuids_list, numSlices=10)
+results = uuid_rdd.flatMap(process_uuid).collect()
+
+# Convert results to DataFrame
+if results:
+    odata_df = spark.createDataFrame(results)
+
+    # Perform anti-join to find unique records
+    unique_from_df2 = (
+        odata_df.join(org_df, on=["objectuuid", "id"], how="left_anti")
+        .withColumnRenamed("objectuuid", "ObjectUUID")
+        .withColumnRenamed("id", "ID")
+    )
+
+    # Write unique records to S3
+    if unique_from_df2.count() > 0:
+        unique_from_df2.repartition(1).write.mode("append").json(f"{destination}/Backfill")
+        print("Data written to S3.")
+    else:
+        print("No unique data found.")
+else:
+    print("No data retrieved from API.")
+
+job.commit()
