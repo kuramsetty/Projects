@@ -1,0 +1,78 @@
+import json
+import requests
+from requests.auth import HTTPBasicAuth
+import boto3
+import pandas as pd
+import awswrangler as wr
+import urllib.parse
+import io
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json, schema_of_json, to_json
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+spark = SparkSession.builder.appName("PandasToSpark").getOrCreate()
+
+# Retrieve secrets from AWS Secrets Manager
+secret_manager = boto3.client("secretsmanager")
+secret = json.loads(secret_manager.get_secret_value(SecretId="dor-tpu-syncos-db")["SecretString"])
+
+username = secret.get('username')
+password = secret.get('password')
+
+# List of API URLs
+api_urls = [
+    "http://dortpu1-syncos1.bmsnrwmes.cnb:5050/schema/COV_2017_Stichprobe_MVR_Dashboard",
+    "http://dortpu1-syncos1.bmsnrwmes.cnb:5050/schema/COV_6002_Dashboard",
+    "http://dortpu1-syncos1.bmsnrwmes.cnb:5050/schema/COV_6005_Probennahmeliste",
+    "http://dortpu1-syncos1.bmsnrwmes.cnb:5050/schema/COV_6015_Spec_Vergleich",
+	"http://dortpu1-syncos1.bmsnrwmes.cnb:5050/schema/COV_6021_Stichprobe_Zug_Dashboard"
+]
+
+# Headers
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.48'
+}
+
+# Function to fetch data with pagination
+def fetch_all_pages(base_url):
+    all_data = []
+    next_link = base_url
+    
+    with requests.Session() as session:
+        while next_link:
+            try:
+                response = session.get(next_link, headers=headers, verify=False, auth=HTTPBasicAuth(username, password))
+                
+                if response.status_code == 200:
+                    json_data = response.json()
+                    all_data.extend(json_data.get("value", []))  # Append fetched data
+                    
+                    # Check for pagination
+                    next_link = json_data.get("@odata.nextLink")
+                    
+                else:
+                    print(f"Failed {next_link} with status code {response.status_code}")
+                    break
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching {next_link}: {e}")
+                break
+    
+    return all_data
+
+# Process each API URL
+for url in api_urls:
+    data = fetch_all_pages(url)
+    
+    if data:
+        df = pd.DataFrame(data)
+        url_suffix = urllib.parse.urlparse(url).path.split("/")[-1]
+        s3_destination = f"s3://cap-qa-data-lake/syncos1/raw/{url_suffix}.parquet"
+        wr.s3.to_parquet(df=df, path=s3_destination)
+        df = spark.read.parquet(s3_destination)
+        df.show()
+        df.printSchema()
+        s3_transformed_destination = f"s3://cap-qa-data-lake/syncos1/transformed/{url_suffix}/"
+        df.write.mode("overwrite").parquet(s3_transformed_destination)
+        print(f"Data saved to {s3_destination}")
+    else:
+        print(f"No data found for {url}")
