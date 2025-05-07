@@ -1,0 +1,34 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+
+
+data = [(12,"Naveen","Hyderabad",30),(13,"Tripati","Delhi",40),(13,"Robert","Russia",50),(14,"Micheal","Newyork",60)]
+schema = ["customerid","customername","city","age"]
+
+df_customers =spark.createDataFrame(data,schema)
+
+
+df_customers.createOrReplaceTempView("customers")
+print("with regestring the table")
+spark.sql("select * from customers where age>50").show()
+
+
+
+print("without regestring the table")
+
+gold_df =spark.sql("""select * from {customers_new} where age >40""", customers_new=df_customers)
+
+gold_df.show()
+
+
+#df.show()
