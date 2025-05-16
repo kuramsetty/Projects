@@ -1,0 +1,209 @@
+empid, ename, sal, doj
+
+
+
+
+
+
+
+
+output should  have 40 records
+10records top 10 on sal
+10 records bottom 10 based on sal
+
+oldest 10 employee records
+newest 10 employee records
+
+
+from pyspark import Sparksession
+form pyspark.sql import *
+
+spark = SparkSession.builder.getorcreate()
+
+df= spark.createDataFrame(data,schema)
+
+windowspec =   dense_rank over (sal) desc
+
+df.withcolumn("rank",windowspec).filter(where rank<10)
+
+windowspec1 =   dense_rank over (sal) 
+
+
+df.withcolumn("rank",windowspec).filter(where rank>10)
+
+
+
+windowspec3 =   dense_rank over (doj) desc
+
+df.withcolumn("rank",windowspec).filter(where rank>10)
+
+windowspec4 =   dense_rank over (doj) 
+
+
+df.withcolumn("rank",windowspec).filter(where rank>10)
+
+
+df_res= df1.union(df2).union(df3).union(df4)
+
+
+    select * from (select empno,sal  ,rank() over(empno order by sal desc ) as rnk from emp) where rnk <=10
+	
+	
+productid,invoiceamount, invoicedate,cummalativemonth,cummalativeyear
+
+
+df.withcolumn(month,  extract_month(invoicedate)
+
+df.withcolumn(year, extract_year(invoicedate)
+
+df_month=df.withcolum(cummalativemoth, sum() over(invoiceamount).partion(month) rolling over first to last)
+
+df_year =df.withcolum(cummalativemoth, sum() over(invoiceamount).partion(year) rolling over first to last)
+
+
+        select productid,sum(invoiceamount), invoicedate group by ( mon,(invoicedate,dd-mon-yyyy)) lead 1 lag 1
+		
+		--------------------------------------------------------------------------------------------------------
+		
+
+select * from (select empno,sal,deptno,rank() over(deptno order by sal desc) as rnk )tmp where rnk =2
+
+
+
+
+
+from pyspark import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+df =spark.read.csv("xyz.csv",schema)
+
+--------------------------------------------------
+Prashant More  12:16 PM
+
+test_dict = {'month' : [1, 2, 3],'name' : ['Jan', 'Feb', 'March']} #output = {1: 'Jan', 2: 'Feb', 3: 'March'}
+
+
+
+list1 = test_dict.getvalue(month)
+list2 = test_dict .getvalue(name)
+
+dict_res ={ }
+for i, j in list1,list2:
+	dict_res.append(key,value)
+	
+	
+	
+	
+	
+	Prashant More  12:22 PM
+
+Table A --------
+ Id --------
+ 1 
+ 1 -------- 
+ Table B -------- 
+ Id --------
+ 1 
+ 0 --------------------------------
+ 
+ 
+ table.A.id  table.b.id
+ 1				1
+ 1				1
+ NA				0
+ 
+ 
+ 
+ ---------------------------------------------------------------
+ Write an SQL query to find the second highest salary in each department along with the department name and the employee(s) who earn that salary.
+
+
+
+  select * from ( select deptname,empname ,(dense_rank over(deptno) order by sal desc) as rnk from  emp) where rnk=2
+  
+  
+  
+  Find Employees Who Earn More Than the Average Salary in Their Department
+  
+  
+  emp,dept
+  from pyspark.sql import SparkSession
+  from pyspark.sql.functions import *
+  from pyspark.window import Window
+  
+  
+  spark = SparkSession.builder.getorCreate()
+  
+  empdata= [(12,10,100000),(13,20,200000),(14,30,300000)]
+  
+  schema =["empid","deptid","salary"]
+  
+  df = spark.Create(empdata,schema)
+  
+  windowspec = Window.partitionBy(col("deptid"))
+  
+  result_df =df.withColum("avgsal"),avg(col("salary"))
+  
+  final_df = df.filter(sal>avgsal)
+  
+  
+  what are args and kwargs 
+  
+  
+ -------------------------------------
+ 
+ data = [10 -3,]
+import pyspark.sql import avg
+
+df = create(data)
+
+df.select
+
+_sum(colum).
+
+
+
+df.groupby(deptname).agg(avg(salary)
+
+df.show()
+
+
+emp     dept
+
+empid ,deptno,employee   deptno deptname 
+
+
+emp_df
+dept_df
+
+
+final_df = emp_df.join(dept_df , emp_df.deptno=dept_df.deptno,how=innerjoin)
+
+
+select * from ( dense rank on (salary)  order by desc)as rank  emp  where rank = nth 
+
+
+
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+
+
+
+
+
+
+
+
+
