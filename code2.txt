@@ -1,0 +1,546 @@
+# Standard library imports
+import os
+import sys
+import traceback
+import re
+
+# PySpark imports
+from pyspark.sql import SparkSession, DataFrame, Column
+from pyspark.sql.window import Window
+from pyspark.sql import functions as f
+from pyspark.sql.types import StructType, StringType, IntegerType, BooleanType, TimestampType, DateType, DecimalType
+
+# AWS Glue imports
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+
+# Initialize Spark and Glue job
+spark = SparkSession.builder.getOrCreate()
+glue_context = GlueContext(spark)
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "SOURCE_LOCATION", "OUTPUT_LOCATION", "ENV"])
+source = args["SOURCE_LOCATION"]
+destination = args["OUTPUT_LOCATION"]
+env = args["ENV"]
+
+# Set necessary Spark configurations
+spark.conf.set('spark.sql.parquet.int96RebaseModeInRead', 'legacy')
+spark.conf.set('spark.sql.parquet.int96RebaseModeInWrite', 'legacy')
+spark.conf.set('spark.sql.parquet.datetimeRebaseModeInRead', 'legacy')
+
+# Initialize Glue job
+job = Job(glue_context)
+job.init(args["JOB_NAME"], args)
+
+try:
+    def read_table(database, table):
+        return glue_context.create_dynamic_frame.from_catalog(database=database, table_name=table,additional_options={"useGlueDataCatalog": True, "recurse": True}).toDF()
+
+######################
+### Loading tables ###
+######################
+
+# Loading all required tables
+    df_profile = read_table('sap-cdp-cloud','uni_profile')
+    df_trade = read_table('sap-cdp-cloud','activity_tradefair_event')
+    df_moments = read_table('sap-cdp-cloud','activity_interesting_moment')
+    df_forms = read_table('sap-cdp-cloud','activity_form_submission')
+    df_leads = read_table('sap-cdp-cloud','activity_lead')
+	df_leads.show()
+    
+    print("df_profile",df_profile.printSchema()) 
+    print("df_trade",df_trade.printSchema()) 
+    print("df_moments",df_moments.printSchema())     
+    print("df_forms",df_forms.printSchema())    
+    print("df_leads",df_leads.printSchema())
+####################################
+### Translation / Mapping Tables ###
+####################################
+
+# region - Mapping Tables
+
+# Create mapping expression for agreed on action values
+    mapping_expr_agreed_on_action = f.create_map([
+        f.lit(101), f.lit("Visit/Contact by techn."),
+        f.lit(111), f.lit("Visit /Contact by Sales"),
+        f.lit(121), f.lit("Sample"),
+        f.lit(131), f.lit("Trials"),
+        f.lit(161), f.lit("no action need"),
+        f.lit(171), f.lit("Visit/Contact by Marketing"),
+        f.lit(181), f.lit("Web sample"),
+        f.lit(191), f.lit("Web RFQ"),
+        f.lit(201), f.lit("Web Appointment"),
+        f.lit(211), f.lit("Webinar")
+    ])
+
+# Create mapping expression for contact status values
+    mapping_expr_contact_status = f.create_map([
+        f.lit(1), f.lit("In Preparation"),
+        f.lit(2), f.lit("Active"),
+        f.lit(3), f.lit("Blocked"),
+        f.lit(4), f.lit("Obsolete"),
+        f.lit(5), f.lit("Deleted")
+    ])
+
+# Create mapping expression for contact department values
+    mapping_expr_department = f.create_map([
+        f.lit("Z001"), f.lit("Executive Board"),
+        f.lit("Z002"), f.lit("Procurement"),
+        f.lit("Z003"), f.lit("Sales"),
+        f.lit("Z004"), f.lit("Organization/IT"),
+        f.lit("Z005"), f.lit("Administration"),
+        f.lit("Z006"), f.lit("Production"),
+        f.lit("Z007"), f.lit("HSEQ"),
+        f.lit("Z008"), f.lit("Accounting"),
+        f.lit("Z009"), f.lit("Finance"),
+        f.lit("Z010"), f.lit("Legal"),
+        f.lit("Z011"), f.lit("Business Development"),
+        f.lit("Z012"), f.lit("Logistics"),
+        f.lit("Z013"), f.lit("Technical"),
+        f.lit("Z014"), f.lit("Reach"),
+        f.lit("Z015"), f.lit("Marketing"),
+        f.lit("Z016"), f.lit("Others"),
+        f.lit("Z017"), f.lit("R&D, Engineering"),
+        f.lit("Z018"), f.lit("Finance & Accounting"),
+        f.lit("Z019"), f.lit("Quality & Regulator"),
+        f.lit("Z020"), f.lit("Supply Chain"),
+        f.lit("Z021"), f.lit("Executive Management"),
+        f.lit("Z022"), f.lit("Product Design")
+    ])
+
+# Create mapping expression for inferred industry interests values
+    mapping_expr_industry = f.create_map([
+        f.lit("cov_101"), f.lit("Automotive"),
+        f.lit("cov_102"), f.lit("Aviation"),
+        f.lit("cov_103"), f.lit("Bikes & motorcycles"),
+        f.lit("cov_111"), f.lit("Construction & architectural"),
+        f.lit("cov_121"), f.lit("Cosmetics"),
+        f.lit("cov_131"), f.lit("Electronics, appliances & telecommunications"),
+        f.lit("cov_141"), f.lit("Energy"),
+        f.lit("cov_151"), f.lit("Healthcare"),
+        f.lit("cov_161"), f.lit("Industrial and Agricultural applications"),
+        f.lit("cov_171"), f.lit("Marine & Ships"),
+        f.lit("cov_181"), f.lit("Packaging & Print"),
+        f.lit("cov_191"), f.lit("Rail"),
+        f.lit("cov_192"), f.lit("Reefer Containers"),
+        f.lit("cov_201"), f.lit("Security & Protection"),
+        f.lit("cov_211"), f.lit("Sports & Leisure"),
+        f.lit("cov_221"), f.lit("Wood & furniture")
+    ])
+
+# Create mapping expression for inferred strategic interests values
+    mapping_expr_inferred_strategic = f.create_map([
+        f.lit("cov_st01"), f.lit("Circular economy"),
+        f.lit("cov_st02"), f.lit("Electrification"),
+        f.lit("cov_st03"), f.lit("Smart designs"),
+        f.lit("cov_st04"), f.lit("Sustainable living")
+    ])
+
+# Create mapping expression for inferred material interests material values
+    mapping_expr_material = f.create_map([
+        f.lit(101), f.lit("3D Print"),
+        f.lit(111), f.lit("Adhesives"),
+        f.lit(121), f.lit("Coatings"),
+        f.lit(131), f.lit("Composites"),
+        f.lit(141), f.lit("Elastomers"),
+        f.lit(151), f.lit("Film"),
+        f.lit(161), f.lit("Foams"),
+        f.lit(171), f.lit("Plastics"),
+        f.lit(181), f.lit("Thermoplastic Polyurethane"),
+        f.lit(191), f.lit("Others"),
+        f.lit(201), f.lit("Basic Chemicals")
+    ])
+
+# Create mapping expression for application values
+    mapping_expr_applications = f.create_map([
+        f.lit(101), f.lit("Automotive interior"),
+        f.lit(111), f.lit("Automotive exterior"),
+        f.lit(121), f.lit("Automotive lighting"),
+        f.lit(131), f.lit("EV battery packaging"),
+        f.lit(141), f.lit("Automotive seating"),
+        f.lit(151), f.lit("Doors and windows"),
+        f.lit(161), f.lit("Insulation and protection"),
+        f.lit(171), f.lit("Walls, facades and roofs"),
+        f.lit(181), f.lit("Flooring"),
+        f.lit(191), f.lit("Pipelines and cables"),
+        f.lit(201), f.lit("Hair care"),
+        f.lit(211), f.lit("Makeup and nail polish"),
+        f.lit(221), f.lit("Skin care"),
+        f.lit(231), f.lit("Sun protection"),
+        f.lit(241), f.lit("Batteries and chargers"),
+        f.lit(251), f.lit("Cases for consumer electronics"),
+        f.lit(261), f.lit("Housing and insulation"),
+        f.lit(271), f.lit("Lighting and LED"),
+        f.lit(281), f.lit("Screens and displays"),
+        f.lit(291), f.lit("Appliances"),
+        f.lit(301), f.lit("Solar panels"),
+        f.lit(311), f.lit("Weather balloons and Buoys"),
+        f.lit(321), f.lit("Wind energy"),
+        f.lit(331), f.lit("Energy storage"),
+        f.lit(341), f.lit("Drug delivery"),
+        f.lit(351), f.lit("Surgical"),
+        f.lit(361), f.lit("Wound care"),
+        f.lit(371), f.lit("Electromedical equipment"),
+        f.lit(381), f.lit("Eyewear"),
+        f.lit(391), f.lit("Agriculture, construction and earthmoving equipment"),
+        f.lit(401), f.lit("Animal identification tags"),
+        f.lit(411), f.lit("Profiles and belts"),
+        f.lit(421), f.lit("Wheels and rollers"),
+        f.lit(431), f.lit("Mining"),
+        f.lit(441), f.lit("Oil and gas"),
+        f.lit(451), f.lit("Machine covers"),
+        f.lit(461), f.lit("Marine and ships solutions"),
+        f.lit(471), f.lit("Labeling"),
+        f.lit(481), f.lit("Packaging"),
+        f.lit(491), f.lit("Signs"),
+        f.lit(501), f.lit("Printing rollers and blades"),
+        f.lit(511), f.lit("Rail interior"),
+        f.lit(521), f.lit("Rail exterior"),
+        f.lit(531), f.lit("ID and security documents"),
+        f.lit(541), f.lit("Protective apparel"),
+        f.lit(551), f.lit("Textured synthetics"),
+        f.lit(561), f.lit("Functional textiles"),
+        f.lit(571), f.lit("Goggles and wearables"),
+        f.lit(581), f.lit("Shoes and footwear"),
+        f.lit(591), f.lit("Sports equipment"),
+        f.lit(601), f.lit("Hard furniture"),
+        f.lit(611), f.lit("Mattresses"),
+        f.lit(621), f.lit("Upholstery"),
+        f.lit(631), f.lit("Engineered wood and wood assembly")
+    ])
+
+# Create mapping expression for distribution channel values
+    mapping_expr_distribution_channels = f.create_map([
+        f.lit("SL"), f.lit("SLB BrunsbÃ¼ttel only"),
+        f.lit("Z0"), f.lit("Covestro Standard 00")
+    ])
+
+# Create mapping expression for division values
+    mapping_expr_division = f.create_map([
+        f.lit("00"), f.lit("Covestro Standard 00"),
+        f.lit("01"), f.lit("Product Division 01"),
+        f.lit("NG"), f.lit("Sideline operations")
+    ])
+
+# Create mapping expression for lead source values
+    mapping_expr_lead_source = f.create_map([
+        f.lit("001"), f.lit("Trade fair"),
+        f.lit("002"), f.lit("External partner"),
+        f.lit("003"), f.lit("Campaign"),
+        f.lit("004"), f.lit("Telephone inquiry"),
+        f.lit("005"), f.lit("Roadshow"),
+        f.lit("007"), f.lit("Deal Registration"),
+        f.lit("Z01"), f.lit("LinkedIn"),
+        f.lit("Z02"), f.lit("Chembid"),
+        f.lit("Z03"), f.lit("CDS (Covestro Direct Store)"),
+        f.lit("Z04"), f.lit("Order@Covestro"),
+        f.lit("Z05"), f.lit("Solution Center"),
+        f.lit("Z06"), f.lit("DES"),
+        f.lit("Z07"), f.lit("Customer Lounge"),
+        f.lit("Z08"), f.lit("SpecialChem"),
+        f.lit("Z09"), f.lit("SF TPU companion"),
+        f.lit("Z10"), f.lit("Social CRM"),
+        f.lit("Z11"), f.lit("UL Prospector"),
+        f.lit("Z12"), f.lit("Imagio")
+    ])
+
+# Create mapping expression for lead qualification level values
+    mapping_expr_lead_qualification_level = f.create_map([
+        f.lit("01"), f.lit("Cold"),
+        f.lit("02"), f.lit("Warm"),
+        f.lit("03"), f.lit("Hot")
+    ])
+
+# Create mapping expression for reason code values
+    mapping_expr_reason = f.create_map([
+        f.lit(101), f.lit("General Information"),
+        f.lit(111), f.lit("Technical"),
+        f.lit(121), f.lit("New Development"),
+        f.lit(131), f.lit("Supply Chain"),
+        f.lit(141), f.lit("Commercial"),
+        f.lit(151), f.lit("Process technology"),
+        f.lit(161), f.lit("PSRA/ HSEQ/ Advocacy"),
+        f.lit(171), f.lit("Complaint"),
+        f.lit(181), f.lit("Innovation"),
+        f.lit(191), f.lit("Raw Material Supply"),
+        f.lit(201), f.lit("Sustainability/ Circular economy"),
+        f.lit(211), f.lit("Others")
+    ])
+
+# Create mapping expression for lead status
+    mapping_expr_lead_status = f.create_map([
+        f.lit('05'), f.lit('Declined'),
+        f.lit('04'), f.lit('Accepted'),
+        f.lit('03'), f.lit('Converted'),
+        f.lit('02'), f.lit('Qualified'),
+        f.lit('01'), f.lit('Open')
+    ])
+
+# endregion
+
+#######################
+### Transformations ###
+#######################
+
+# region - Transform profile data
+
+    df_profile = df_profile.withColumn("contact_name", f.concat_ws(" ", "firstname", "middlename", "lastname"))
+   
+    # Explode structure fields to single fields          
+    df_profile = df_profile.select("*",
+                                f.col("cov_primary_address.cov_country").alias("contact_country_code"),
+                                f.col("cov_primary_address.cov_city").alias("contact_city"),
+                                f.col("cov_primary_address.cov_address_line").alias("contact_street"),
+                                f.col("cov_primary_address.cov_pincode").alias("contact_postal_code"),
+                                f.col("cov_primary_address.cov_state").alias("contact_state"),
+                                f.col("company.cov_job_title").alias("job_title"),
+                                f.col("company.cov_snpdy_acc_web").alias("cov_snpdy_acc_web"),
+                                f.col("company.department").alias("department_code"),
+                                f.col("company.industry").alias("industry"),
+                                f.col("company.jobfunction").alias("job_function"),
+                                f.col("company.name").alias("company_name"),
+                                f.col("cov_market_consent.cov_optin").alias("optin"),
+                                f.col("cov_market_consent.cov_optin_implicit").alias("optin_implicit"),
+                                f.col("cov_market_consent.cov_consent_source").alias("consent_source"),
+                                f.col("cov_market_consent.cov_optin_date_tim").alias("optin_date_time")
+                            )
+
+    # Create a new c4c_contact_id field
+    df_profile = df_profile.withColumn("c4c_contact_id",
+                                 f.when(f.col("cov_c4c_contact_id").isNotNull() & 
+                                       (f.size("cov_c4c_contact_id") > 0),
+                                       f.col("cov_c4c_contact_id").getItem(0))
+                                 .otherwise(None))
+
+    # Create a new department_name field
+    df_profile = df_profile.withColumn("department_name",
+                                    f.coalesce(mapping_expr_department.getItem(f.col("department_code")),
+                                                f.col("department_code")))
+
+    # Create a new contact_status_name field
+    df_profile = df_profile.withColumn("contact_status_name",
+                                    f.coalesce(mapping_expr_contact_status.getItem(f.col("cov_contact_status")),
+                                                f.col("cov_contact_status")))
+
+    # Selection of relevant fields
+    sel_profile = df_profile.selectExpr(
+                                    "primaryemail", "created as creation_date_time", "updated", "contact_name", "primaryphone",
+                                    "c4c_contact_id", "department_code", "department_name", "optin_date_time",
+                                    "cov_contact_status as contact_status_code", "company_name", "optin", "contact_status_name",
+                                    "cov_function as function", "job_title", "optin_implicit", "consent_source",
+                                    "cov_frst_reg_type as first_registration_type", "cov_frst_reg_src as first_registration_source",
+                                    "contact_country_code", "contact_city", "contact_street", "contact_postal_code", "contact_state",
+                                    "firstseen as first_seen_date", "lastseen as last_seen_date"
+                                ).dropDuplicates()
+
+# endregion
+
+# region -  Transform cov_interests_mat structure field into a new data frame
+    # First, extract the keys (field names) from your structure
+    keys_cov_interests_mat = df_profile.select("cov_interests_mat.*").columns
+
+    # Create a new DataFrame with primaryemail and material interest columns
+    df_cov_interest_mat = df_profile.select(
+        "primaryemail",  # The identifier column from the original DataFrame
+         f.explode(
+             f.array([
+                 f.when(f.col("cov_interests_mat." + key) == True, f.lit(key))
+                 .otherwise(f.lit(None))
+                 for key in keys_cov_interests_mat
+             ]).alias("temp_array")
+         ).alias("inferred_interest_mat_code")
+     ).filter("inferred_interest_mat_code IS NOT NULL").dropDuplicates()
+
+    # Add the text translation column
+    sel_cov_interest_mat = df_cov_interest_mat.withColumn(
+                                                        "inferred_interest_mat_name",
+                                                        mapping_expr_material[f.col("inferred_interest_mat_code")]
+                                                        ).dropDuplicates()
+
+# endregion
+
+# region - Transform cov_interests_st structure field into a new data frame
+    
+    # First, extract the keys (field names) from your structure
+    keys_cov_interests_st = df_profile.select("cov_interests_st.*").columns
+
+    # Create a new DataFrame with primaryemail and strategic interests columns
+    df_cov_interests_st = df_profile.select(
+         "primaryemail",  # The identifier column from the original DataFrame
+         f.explode(
+             f.array([
+                 f.when(f.col("cov_interests_st." + key) == True, f.lit(key))
+                 .otherwise(f.lit(None))
+                 for key in keys_cov_interests_st
+             ]).alias("temp_array")
+         ).alias("inferred_interests_strategic_code")
+     ).filter("inferred_interests_strategic_code IS NOT NULL").dropDuplicates()
+    
+    # Add the text translation column
+    sel_cov_interests_st = df_cov_interests_st.withColumn(
+         "inferred_interests_strategic_name",
+         mapping_expr_inferred_strategic[f.col("inferred_interests_strategic_code")]
+     ).dropDuplicates()
+
+# endregion
+
+# region - Transform cov_interests_ind structure field into a new data frame
+    
+    # First, extract the keys (field names) from your structure
+    keys_cov_interests_ind = df_profile.select("cov_interests_ind.*").columns
+    
+    # Create a new DataFrame with primaryemail and industry interest columns
+    df_cov_interests_ind = df_profile.select(
+                                            "primaryemail",  # The identifier column from the original DataFrame
+                                            f.explode(
+                                                f.array([
+                                                    f.when(f.col("cov_interests_ind." + key) == True, f.lit(key))
+                                                    .otherwise(f.lit(None))
+                                                    for key in keys_cov_interests_ind
+                                                ]).alias("temp_array")
+                                            ).alias("inferred_interests_industry_code")
+                                            ).filter("inferred_interests_industry_code IS NOT NULL").dropDuplicates()
+
+    # Add the text translation column
+    sel_cov_interests_ind = df_cov_interests_ind.withColumn(
+                                                        "inferred_interests_industry_name",
+                                                        mapping_expr_industry[f.col("inferred_interests_industry_code")]
+                                                    ).dropDuplicates()
+
+# endregion
+
+# region - Transform interesting moments data
+    
+    # Select only necessary columns and remove duplicates
+    sel_moments = df_moments.selectExpr(
+                                    "primaryemail", "cov_moment_datetime as interesting_moment_date",
+                                    "cov_moment_desc as interesting_moment_description",
+                                    "cov_moment_type as interesting_moment_type"
+                                ).dropDuplicates()
+
+# endregion
+
+# region - Transform lead data from cdp for join
+
+    # Add the new translated column
+    df_leads = df_leads.withColumn("lead_status_name", mapping_expr_lead_status[f.col("cov_lead_status")])
+    df_leads = df_leads.withColumnRenamed("cov_lead_status", "lead_status_code")
+
+    # Select only necessary columns and remove duplicates
+    sel_leads = df_leads.selectExpr(
+                                    "id as lead_id", "cov_snpdy_id as snap_addy_id", "cov_account_id as account_id_c4c",
+                                    "cov_account_name as account_name", "cov_business_ent", "cov_c4c_contact_id", 
+                                    "cov_campaign_id as campaign_id", "created as created_at_cdp", 
+                                    "lead_status_name", "lead_status_code", "cov_lead_title as lead_title", "cov_owner as owner",
+                                    "cov_lead_source", "cov_reg_source", "cov_reg_type as registration_type", "cov_created_at as created_at_c4c",
+                                    "primaryemail"
+                                ).dropDuplicates()
+
+    # Set filter for specific joins
+    sel_leads_trade = sel_leads.filter(f.col("cov_reg_source") == "snapADDY")
+    sel_leads_forms = sel_leads.filter(f.col("cov_reg_source") != "C4C")
+    sel_leads_others = sel_leads.filter(f.col("cov_reg_source") == "C4C")
+
+# endregion
+
+# region - Transform form submission data for lead join
+    
+    # Select only necessary columns and remove duplicates
+    df_forms = df_forms.withColumn("table", f.lit("Form Submission Data)"))
+
+    sel_forms = df_forms.selectExpr(
+                                    "primaryemail as primaryemail_forms", "cov_campaign_id as campaign_id_forms", "cov_submission_type",
+                                    "cov_form_url", "table", "created"
+                                ).dropDuplicates()
+# endregion
+
+# region - Transform trade fair data for lead join
+    df_trade = df_trade.withColumn("table", f.lit("Trade Fair Data)"))
+
+    sel_trade = df_trade.selectExpr(
+                                "primaryemail", "cov_snpdy_id as snap_addy_id",
+                                "table", "cov_snpady_comp_typ", "cov_snpdy_buss_use", "cov_snpdy_comm_rel", "cov_snpdy_contact",
+                                "cov_snpdy_creatd_by", "cov_snpdy_fun_cmpny", "cov_snpdy_id", "cov_snpdy_main_pnt",
+                                "cov_snpdy_oth_point", "cov_snpdy_send_copy", "cov_snpdy_val_chain", "cov_snpdy_your_int",
+                                "cov_start_date", "cov_tradefair_date", "cov_tradefair_date as cov_tradefair"
+                            ).dropDuplicates()
+    
+# endregion
+
+#####################
+### Joins & Union ###
+#####################
+
+# region - Joins
+
+# Execute joins and unions
+    join_lead_trade = sel_leads_trade.join(sel_trade, ["snap_addy_id", 'primaryemail'], "left").dropDuplicates()
+
+    join_lead_forms = sel_leads_forms.join(
+        sel_forms,
+        [
+            sel_leads_forms.campaign_id == sel_forms.campaign_id_forms,
+            sel_leads_forms.primaryemail == sel_forms.primaryemail_forms,
+            (sel_leads_forms.created_at_cdp == sel_forms.created) |
+            ((sel_leads_forms.created_at_cdp > sel_forms.created) &
+            (f.unix_timestamp(sel_leads_forms.created_at_cdp) - f.unix_timestamp(sel_forms.created) <= 7200))
+        ],
+        "left").dropDuplicates().drop("created","primaryemail_forms",'campaign_id_forms')
+    
+# endregion
+    
+# region - Union
+
+# Union dataframes using a single unionByName operation
+    union_lead_data = join_lead_trade \
+        .unionByName(join_lead_forms, allowMissingColumns=True) \
+        .unionByName(sel_leads_others, allowMissingColumns=True) \
+        .dropDuplicates()
+
+# endregion
+
+###############
+### Outputs ###
+###############
+
+# Output 1 - Profile Data
+    finale_profile = sel_profile
+
+    finale_profile.repartition(5).write.mode("Overwrite").parquet(destination + "/cdp_profile_data")
+
+# Output 2 - Inferred Industry Interests 
+    
+    finale_cov_interests_ind = sel_cov_interests_ind
+
+    finale_cov_interests_ind.repartition(5).write.mode("Overwrite").parquet(destination + "/inferred_industry_interests_data")
+
+# Output 3 - Inferred Strategic Interests 
+    
+    finale_cov_interests_st = sel_cov_interests_st
+
+    finale_cov_interests_st.repartition(5).write.mode("Overwrite").parquet(destination + "/inferred_strategic_interests_data")
+
+# Output 4 - Inferred Material Interests 
+    
+    finale_cov_interest_mat= sel_cov_interest_mat
+
+    finale_cov_interest_mat.repartition(5).write.mode("Overwrite").parquet(destination + "/inferred_material_materaial_data")
+
+# Output 5 - Interesting Moments
+    
+    finale_moments = sel_moments
+    
+    finale_moments.repartition(5).write.mode("Overwrite").parquet(destination + "/interesting_moments_data")
+
+# Output 6 - Lead Data
+    
+    finale_lead = union_lead_data
+    
+    finale_lead.repartition(5).write.mode("Overwrite").parquet(destination + "/cdp_lead_data")
+
+except Exception as err:
+    traceback.print_exc()
+    print(err)
+    raise Exception("Error encountered while executing the SQL. Check the error stack in Output logs")
+ 
+job.commit()
